@@ -5,6 +5,9 @@ Simple runner script for the Medical Conversation Agent
 import asyncio
 import sys
 import os
+import json
+from pathlib import Path
+from typing import Optional, Dict, Any
 
 # Add src to path so we can import our modules
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -17,6 +20,42 @@ except ImportError as e:
     print("\nPlease install the required dependencies first:")
     print("pip install -r requirements.txt")
     sys.exit(1)
+
+def format_json(data: Dict[str, Any]) -> str:
+    """Format JSON data with proper indentation and color if available"""
+    try:
+        # Try to use rich for colored output if available
+        from rich import print_json
+        return print_json(data)
+    except ImportError:
+        # Fallback to standard json formatting
+        return json.dumps(data, indent=2, ensure_ascii=False)
+
+def display_conversation_logs(log_dir: str = "logs", limit: int = 5):
+    """Display recent conversation logs in JSON format"""
+    log_path = Path(log_dir)
+    if not log_path.exists():
+        print(f"\n❌ Log directory '{log_dir}' not found.")
+        return
+    
+    log_files = sorted(log_path.glob("medical_conversation_*.json"), reverse=True)
+    if not log_files:
+        print(f"\n❌ No conversation logs found in {log_dir}")
+        return
+    
+    print("\n📜 RECENT CONVERSATION LOGS")
+    print("=" * 60)
+    
+    for log_file in log_files[:limit]:
+        try:
+            with open(log_file, 'r', encoding='utf-8') as f:
+                log_data = json.load(f)
+                print(f"\n📝 Log File: {log_file.name}")
+                print("-" * 60)
+                print(format_json(log_data))
+                print("\n" + "=" * 60)
+        except Exception as e:
+            print(f"Error reading log file {log_file}: {e}")
 
 
 def print_banner():
@@ -31,7 +70,7 @@ def print_banner():
     print("-" * 62)
 
 
-async def run_interactive_mode():
+async def run_interactive_mode(show_logs: bool = True):
     """Run the agent in interactive mode"""
     print_banner()
     
@@ -64,16 +103,9 @@ async def run_interactive_mode():
         # Run the conversation
         result = await agent.start_conversation(user_input)
         
-        # Display results
-        print("\n📊 CONVERSATION SUMMARY")
-        print("=" * 40)
-        print(f"Status: {result['status']}")
-        print(f"Total turns: {result.get('total_turns', 'N/A')}")
-        print(f"Resolved: {result.get('resolved', False)}")
-        
-        if result['status'] == 'completed':
-            print(f"\n🎯 Final Diagnosis/Advice:")
-            print(f"{result.get('doctor_diagnosis', 'N/A')}")
+        # Show conversation logs if requested
+        if show_logs:
+            display_conversation_logs()
         
     except ValueError as e:
         print(f"\n❌ Configuration Error: {e}")
@@ -102,14 +134,11 @@ async def run_batch_mode():
         for i, query in enumerate(sample_queries, 1):
             print(f"\n🔄 Running Conversation {i}/3")
             print("=" * 50)
-            
-            result = await agent.start_conversation(query)
-            
-            print(f"\nResult {i}: {result['status']}")
-            if result['status'] == 'completed':
-                print(f"Turns: {result['total_turns']}, Resolved: {result['resolved']}")
+            await agent.start_conversation(query)
         
         print("\n✅ Batch processing complete!")
+        print("\n📜 Showing conversation logs:")
+        display_conversation_logs(limit=3)  # Show logs for the batch conversations
         
     except Exception as e:
         print(f"\n❌ Error in batch mode: {e}")
@@ -120,10 +149,23 @@ async def run_batch_mode():
 
 def main():
     """Main entry point"""
-    if len(sys.argv) > 1 and sys.argv[1] == "--batch":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Medical Conversation Agent Runner")
+    parser.add_argument("--batch", action="store_true", help="Run in batch mode with sample queries")
+    parser.add_argument("--logs", action="store_true", help="Show conversation logs")
+    parser.add_argument("--logs-only", action="store_true", help="Only display conversation logs without running new conversation")
+    parser.add_argument("--log-dir", type=str, default="logs", help="Directory containing conversation logs")
+    parser.add_argument("--limit", type=int, default=5, help="Number of recent logs to display")
+    
+    args = parser.parse_args()
+    
+    if args.logs_only:
+        display_conversation_logs(args.log_dir, args.limit)
+    elif args.batch:
         asyncio.run(run_batch_mode())
     else:
-        asyncio.run(run_interactive_mode())
+        asyncio.run(run_interactive_mode(show_logs=args.logs))
 
 
 if __name__ == "__main__":

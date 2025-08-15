@@ -9,9 +9,13 @@ from dataclasses import dataclass
 from enum import Enum
 
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langchain_core.language_models import BaseChatModel
+
+from .message_formatter import MessageFormatter
+from .conversation_logger import ConversationLogger
 
 
 class ConversationStatus(Enum):
@@ -22,12 +26,14 @@ class ConversationStatus(Enum):
 class AgentState(TypedDict):
     messages: List[Dict[str, Any]]
     current_turn: Literal["patient", "doctor"]
-    conversation_history: List[str]
+    conversation_history: List[Dict[str, Any]]  # List of structured messages
     patient_query: str
     doctor_diagnosis: str
     status: ConversationStatus
     resolved: bool
     turn_count: int
+    current_response: str  # Temporary storage for current response
+    current_agent: str  # Temporary storage for current agent
 
 
 @dataclass
@@ -44,16 +50,16 @@ class PatientAgent(MedicalAgent):
     
     def __init__(self, llm: BaseChatModel):
         system_prompt = """
-        You are a patient seeking medical advice. You have a specific health concern or symptoms.
+        You are a patient seeking medical advice. Act like a real person having a natural conversation.
         
         Guidelines:
-        - Be specific about your symptoms
-        - Provide relevant medical history when asked
-        - Ask follow-up questions if you need clarification
-        - Be honest about your concerns and symptoms
-        - Don't provide medical advice - you're seeking it
-        - Keep responses conversational and natural
-        - If the doctor provides a diagnosis and treatment plan that addresses your concerns, acknowledge it
+        - Keep messages short and conversational, like texting with a doctor (2-3 sentences max)
+        - Describe symptoms briefly and clearly
+        - Ask questions naturally when you need clarification
+        - Don't explain everything at once - let the doctor ask follow-up questions
+        - Respond directly to the doctor's questions
+        - Show natural concern but avoid being overly dramatic
+        - Use everyday language, not medical terminology
         """
         
         super().__init__(
@@ -67,7 +73,10 @@ class PatientAgent(MedicalAgent):
         """Generate patient response based on conversation state"""
         
         # Build conversation context with last 5 messages
-        conversation_context = "\n".join(state["conversation_history"][-5:])
+        conversation_context = "\n".join([
+            f"{msg['sender']}: {msg['message']}" 
+            for msg in state["conversation_history"][-5:]
+        ])
         
         messages = [
             SystemMessage(content=self.system_prompt),
@@ -82,7 +91,6 @@ class PatientAgent(MedicalAgent):
         ]
         
         response = await self.llm.ainvoke(messages)
-        
         return {
             "response": response.content,
             "agent": "patient"
@@ -94,18 +102,30 @@ class DoctorAgent(MedicalAgent):
     
     def __init__(self, llm: BaseChatModel):
         system_prompt = """
-        You are a professional medical doctor providing consultation to a patient.
+        You are a friendly doctor having a natural conversation with a patient.
         
         Guidelines:
-        - Ask relevant follow-up questions to understand symptoms better
-        - Provide professional medical advice based on symptoms described
-        - Suggest appropriate treatments or next steps
-        - Be empathetic and professional
-        - When you have enough information and have provided a comprehensive diagnosis and treatment plan, you can mark the consultation as resolved
-        - To mark as resolved, end your response with "CONSULTATION_RESOLVED" on a new line
-        - Only mark as resolved when you've provided a complete diagnosis and treatment recommendation
+        - Keep messages brief and conversational (2-3 sentences max)
+        - Ask one focused question at a time
+        - Use simple, everyday language instead of medical jargon
+        - Show empathy through brief, natural responses
+        - Build the conversation gradually - don't try to diagnose immediately
         
-        Remember: This is for educational/demonstration purposes. Always recommend consulting with a real healthcare professional for actual medical concerns.
+        Structure your responses in two parts:
+        1. Patient Message: Your actual response to the patient in simple terms
+        2. Medical Reasoning: Add your medical thoughts/observations after "REASONING:" on a new line
+        
+        When ready to conclude:
+        1. Give a brief diagnosis and simple treatment plan
+        2. Include final reasoning
+        3. End with "CONSULTATION_RESOLVED" on a new line
+        
+        Remember: This is for demonstration. Always include a reminder to see a real doctor.
+        
+        Example response:
+        Hi there! That pain you described sounds like it could be tension-related. Can you tell me if it gets worse with movement?
+
+        REASONING: Patient's symptoms suggest muscular tension. Need to rule out nerve involvement.
         """
         
         super().__init__(
@@ -118,7 +138,10 @@ class DoctorAgent(MedicalAgent):
     async def respond(self, state: AgentState) -> Dict[str, Any]:
         """Generate doctor response based on conversation state"""
         
-        conversation_context = "\n".join(state["conversation_history"][-5:])
+        conversation_context = "\n".join([
+            f"{msg['sender']}: {msg['message']}" 
+            for msg in state["conversation_history"][-5:]
+        ])
         
         messages = [
             SystemMessage(content=self.system_prompt),
@@ -132,8 +155,6 @@ class DoctorAgent(MedicalAgent):
         ]
         
         response = await self.llm.ainvoke(messages)
-        
-        # Check if doctor marked consultation as resolved
         resolved = "CONSULTATION_RESOLVED" in response.content
         
         return {
@@ -146,7 +167,7 @@ class DoctorAgent(MedicalAgent):
 class MedicalConversationAgent:
     """Main agent that orchestrates the conversation between patient and doctor"""
     
-    def __init__(self, llm_model: str = None, temperature: float = None):
+    def __init__(self, llm_model: str = None, temperature: float = None, log_dir: str = "logs"):
         # Import config here to avoid circular imports
         try:
             from .config import Config
@@ -161,6 +182,8 @@ class MedicalConversationAgent:
         self.llm = ChatGroq(model=model, temperature=temp)
         self.patient_agent = PatientAgent(self.llm)
         self.doctor_agent = DoctorAgent(self.llm)
+        self.message_formatter = MessageFormatter(self.llm)
+        self.logger = ConversationLogger(log_dir)
         self.graph = self._build_graph()
     
     def _build_graph(self) -> StateGraph:
@@ -168,26 +191,34 @@ class MedicalConversationAgent:
         
         workflow = StateGraph(AgentState)
         
-        # Add nodes
-        workflow.add_node("patient_turn", self._patient_node)
-        workflow.add_node("doctor_turn", self._doctor_node)
+        # Add nodes for agents and formatting
+        workflow.add_node("patient_node", self._patient_node)
+        workflow.add_node("format_patient", self._format_patient_message)
+        workflow.add_node("doctor_node", self._doctor_node)
+        workflow.add_node("format_doctor", self._format_doctor_message)
         workflow.add_node("check_resolution", self._check_resolution_node)
         
         # Define the flow
-        workflow.set_entry_point("patient_turn")
+        workflow.set_entry_point("patient_node")
         
-        # After patient turn, go to doctor
-        workflow.add_edge("patient_turn", "doctor_turn")
+        # After patient response, format it
+        workflow.add_edge("patient_node", "format_patient")
         
-        # After doctor turn, check if resolved
-        workflow.add_edge("doctor_turn", "check_resolution")
+        # After formatting patient message, go to doctor
+        workflow.add_edge("format_patient", "doctor_node")
+        
+        # After doctor response, format it
+        workflow.add_edge("doctor_node", "format_doctor")
+        
+        # After formatting doctor message, check resolution
+        workflow.add_edge("format_doctor", "check_resolution")
         
         # From check_resolution, either end or continue conversation
         workflow.add_conditional_edges(
             "check_resolution",
             self._should_continue,
             {
-                "continue": "patient_turn",
+                "continue": "patient_node",
                 "end": END
             }
         )
@@ -201,14 +232,24 @@ class MedicalConversationAgent:
         response_data = await self.patient_agent.respond(state)
         response = response_data["response"]
         
-        print(f"Patient: {response}")
-        
-        # Update state
-        state["conversation_history"].append(f"Patient: {response}")
-        state["current_turn"] = "doctor"
+        # Store raw response for formatting
+        state["current_response"] = response
+        state["current_agent"] = "patient"
         
         if state["turn_count"] == 0:
             state["patient_query"] = response
+        
+        return state
+    
+    async def _format_patient_message(self, state: AgentState) -> AgentState:
+        """Format patient message into structured output"""
+        response = state["current_response"]
+        structured_message = self.message_formatter.format_patient_message(response)
+        
+        print(f"Patient: {structured_message['message']}")
+        
+        state["conversation_history"].append(structured_message)
+        state["current_turn"] = "doctor"
         
         return state
     
@@ -220,20 +261,31 @@ class MedicalConversationAgent:
         response = response_data["response"]
         resolved = response_data.get("resolved", False)
         
-        print(f"Doctor: {response}")
+        # Store raw response and resolved status for formatting
+        state["current_response"] = response
+        state["current_agent"] = "doctor"
+        state["resolved"] = resolved
         
         if resolved:
             print("\n🏥 Doctor has marked the consultation as resolved!")
+            state["status"] = ConversationStatus.RESOLVED
         
-        # Update state
-        state["conversation_history"].append(f"Doctor: {response}")
+        return state
+    
+    async def _format_doctor_message(self, state: AgentState) -> AgentState:
+        """Format doctor message into structured output"""
+        response = state["current_response"]
+        structured_message = self.message_formatter.format_doctor_message(response)
+        
+        print(f"Doctor: {structured_message['message']}")
+        print(f"Reasoning: {structured_message['reasoning']}")
+        
+        state["conversation_history"].append(structured_message)
         state["current_turn"] = "patient"
-        state["resolved"] = resolved
         state["turn_count"] += 1
         
-        if resolved:
-            state["status"] = ConversationStatus.RESOLVED
-            state["doctor_diagnosis"] = response
+        if state["resolved"]:
+            state["doctor_diagnosis"] = structured_message["message"]
         
         return state
     
@@ -262,13 +314,20 @@ class MedicalConversationAgent:
             doctor_diagnosis="",
             status=ConversationStatus.ONGOING,
             resolved=False,
-            turn_count=0
+            turn_count=0,
+            current_response="",
+            current_agent=""
         )
         
         # If initial query provided, add it to conversation
         if initial_patient_query:
             initial_state["patient_query"] = initial_patient_query
-            initial_state["conversation_history"].append(f"Patient: {initial_patient_query}")
+            # Add structured initial message
+            initial_message = {
+                "sender": "patient",
+                "message": initial_patient_query
+            }
+            initial_state["conversation_history"].append(initial_message)
             print(f"Patient: {initial_patient_query}")
         
         try:
@@ -278,21 +337,40 @@ class MedicalConversationAgent:
             print("\n" + "=" * 50)
             print("🏥 Medical Consultation Complete")
             
-            return {
+            # Prepare conversation data
+            conversation_data = {
                 "status": "completed",
                 "conversation_history": final_state["conversation_history"],
                 "patient_query": final_state["patient_query"],
                 "doctor_diagnosis": final_state["doctor_diagnosis"],
                 "resolved": final_state["resolved"],
-                "total_turns": final_state["turn_count"]
+                "total_turns": final_state["turn_count"],
+                "metadata": {
+                    "model": self.llm.model,
+                    "temperature": self.llm.temperature
+                }
             }
             
+            # Log the conversation
+            log_file = self.logger.log_conversation(conversation_data)
+            print(f"\n💾 Conversation logged to: {log_file}")
+            
+            return conversation_data
+            
         except Exception as e:
-            print(f"Error during conversation: {str(e)}")
-            return {
+            error_data = {
                 "status": "error",
-                "error": str(e)
+                "error": str(e),
+                "conversation_history": initial_state["conversation_history"],
+                "total_turns": initial_state["turn_count"]
             }
+            
+            # Log error state
+            log_file = self.logger.log_conversation(error_data)
+            print(f"\n💾 Error state logged to: {log_file}")
+            
+            print(f"Error during conversation: {str(e)}")
+            return error_data
 
 
 # Example usage and testing
