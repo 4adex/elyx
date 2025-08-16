@@ -63,16 +63,21 @@ class MedicalAgent:
         - Each member has a dynamic, personalized health plan that evolves with their journey
         - All interactions contribute to a comprehensive understanding of the member's goals, medical history, and health history
         - Everything a member does with Elyx (medical regimes, health plans, therapies) is part of their unique journey
+
+        Here you are dealing with a patient, and this is just a thread of one of queries he asks in 4-5 times a week. So try to resolve it as soon as possible.
         """
         
         common_guidelines = """
         Common guidelines for all medical team members:
         - Keep responses focused and concise (2-3 lines maximum).
-        - When your part is complete or another specialist would be more appropriate, use TRANSFER:RUBY on a new line to hand control back to Ruby.
-        - Always consider the member's full journey and long-term health outcomes
+        - When your part is complete or you must transfer your control back to main doctor agent ruby, use TRANSFER:RUBY on a new line to hand control back to Ruby.
+        - If you think that conversation has been resolved then 
         - Frame advice in context of their personalized health plan and goals
         """
-        self.system_prompt = f"{elyx_context}\n\n{system_prompt.strip()}\n\n{common_guidelines}"
+        if role.lower() == "patient":
+            self.system_prompt = system_prompt.strip()
+        else:
+            self.system_prompt = f"{elyx_context}\n\n{system_prompt.strip()}\n\n{common_guidelines}"
         self.name = name
         self.role = role
         self.llm = llm
@@ -80,7 +85,7 @@ class MedicalAgent:
     async def respond(self, state: AgentState) -> Dict[str, Any]:
         """Default respond - can be overridden by subclasses"""
         conversation_context = "\n".join([
-            f"{msg['sender']}: {msg['message']}" for msg in state["conversation_history"][-6:]
+            f"{msg['sender']}: {msg['message']}" for msg in state["conversation_history"][-12:]
         ])
         messages = [
             SystemMessage(content=self.system_prompt),
@@ -153,10 +158,16 @@ class ConciergeAgent(MedicalAgent):
         system_prompt = """
         You are Ruby, the Concierge / Orchestrator. Empathetic, organized, and proactive.
         - Always open the team's turn with a short 1-2 line message.
-        - Announce which specialist will take the lead next by setting CONTROL:<agent_name> in your message (e.g. CONTROL:dr_warren).
-        - Use plain language and confirm actions. Keep it tiny (1-2 lines).
-        - If you think that good enough consulting has been done or if the conversation grew very long then just sum it up for patient and include CONSULTATION_RESOLVED on a new line to mark the end.
+        - Announce which specialist will take the lead next by setting CONTROL:<agent_name>
+        - END CONVERSATIONS WHEN:
+          1. Medical concern has been addressed
+          2. Clear next steps are established
+          3. Patient has confirmed understanding
+          4. No further value can be added in this session
+        - Use CONSULTATION_RESOLVED token when ending conversations
+        - LIMIT CONVERSATIONS to 6-8 turns maximum
         """
+
         super().__init__(name="Ruby", role="concierge", llm=llm, system_prompt=system_prompt)
 
     async def respond(self, state: AgentState) -> Dict[str, Any]:
@@ -286,17 +297,26 @@ class OrchestatedAgent:
         workflow.add_node("format_patient", self._format_patient_message)
         workflow.add_node("check_resolution", self._check_resolution_node)
 
-        # Flow: Ruby -> format -> control dispatch -> agent -> format -> patient -> format -> check_resolution
+        # Flow with conditional branching for Ruby control
         workflow.set_entry_point("ruby_node")
         workflow.add_edge("ruby_node", "format_ruby")
         workflow.add_edge("format_ruby", "control_dispatch")
-        workflow.add_edge("control_dispatch", "agent_node")
+        
+        # Add conditional edges from control_dispatch
+        workflow.add_conditional_edges(
+            "control_dispatch",
+            lambda x: "ruby_flow" if x["control_agent"] == "ruby" else "agent_flow",
+            {
+                "ruby_flow": "patient_node",  # If control is ruby, skip agent node and go directly to patient
+                "agent_flow": "agent_node"    # Otherwise continue through agent node
+            }
+        )
+        
         workflow.add_edge("agent_node", "format_agent")
         workflow.add_edge("format_agent", "patient_node")
         workflow.add_edge("patient_node", "format_patient")
         workflow.add_edge("format_patient", "check_resolution")
 
-        # From check_resolution decide whether to go back to ruby_node or to the next agent (via control_dispatch), or end.
         workflow.add_conditional_edges(
             "check_resolution",
             self._should_continue,
@@ -311,12 +331,15 @@ class OrchestatedAgent:
 
 
     def _should_continue(self, state: AgentState) -> str:
-        """Decide next step after patient turn:
-           - If resolved or turns >= limit -> end
-           - If control_agent is set and not 'ruby' -> continue_agent (call control_dispatch -> agent_node)
-           - Otherwise -> continue_ruby (Ruby gets the next team turn)
-        """
-        if state.get("resolved"):
+        # Add turn limit check
+        if state.get("turn_count", 0) >= 15:  # Reasonable conversation limit
+            print("\n=== Turn limit reached, forcing resolution ===")
+            state["resolved"] = True
+            state["status"] = ConversationStatus.RESOLVED
+            return "end"
+
+        # Existing resolution check
+        if state.get("status") == ConversationStatus.RESOLVED or state.get("resolved"):
             return "end"
 
         control = (state.get("control_agent") or "").lower()
@@ -365,6 +388,7 @@ class OrchestatedAgent:
         control = state.get("control_agent") or ControlAgent.DR_WARREN.value
         # normalize aliases
         control = control.lower()
+        
         state["current_agent"] = control
         return state
 
@@ -377,19 +401,23 @@ class OrchestatedAgent:
             ControlAgent.CARLA.value: self.carla,
             ControlAgent.RACHEL.value: self.rachel,
             ControlAgent.NEEL.value: self.neel
-        }.get(control, self.ruby)
+        }.get(control)
 
         response_data = await agent_obj.respond(state)
         text = response_data.get("response", "")
-        resolved = response_data.get("resolved", False)
+        resolved = response_data.get("resolved", False)  # Only use the flag since text is already cleaned
         transfer = response_data.get("transfer_to")
 
         # If agent asked to transfer control, record it so Ruby can confirm next loop.
         if transfer:
             # canonicalize common names
             state["control_agent"] = transfer
+            
         state["current_response"] = text
-        state["resolved"] = state.get("resolved") or resolved
+        # Ensure resolved state is properly updated
+        if resolved:
+            state["resolved"] = True
+            state["status"] = ConversationStatus.RESOLVED
         return state
 
     async def _format_agent_message(self, state: AgentState) -> AgentState:
@@ -502,7 +530,11 @@ class OrchestatedAgent:
                 "conversation_history": initial_state["conversation_history"],
                 "total_turns": initial_state["turn_count"]
             }
+            import traceback
+            error_traceback = traceback.format_exc()
             log_file = self.logger.log_conversation(error_data)
             print(f"\n💾 Error state logged to: {log_file}")
             print(f"Error during conversation: {str(e)}")
+            print("Traceback:")
+            print(error_traceback)
             return error_data
