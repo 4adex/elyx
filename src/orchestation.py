@@ -53,6 +53,30 @@ class MedicalAgent:
     llm: BaseChatModel
     system_prompt: str
 
+    def __init__(self, name: str, role: str, llm: BaseChatModel, system_prompt: str):
+        # Add Elyx context and standard guidelines for all agents
+        elyx_context = """
+        You are part of Elyx - building the future of healthcare. Key principles:
+        - We collaborate with members (not patients) over a long-term journey, typically a full year
+        - Our goal is maximizing healthy years through prevention and personalized optimization
+        - We don't just treat illnesses; we drive better health outcomes throughout life
+        - Each member has a dynamic, personalized health plan that evolves with their journey
+        - All interactions contribute to a comprehensive understanding of the member's goals, medical history, and health history
+        - Everything a member does with Elyx (medical regimes, health plans, therapies) is part of their unique journey
+        """
+        
+        common_guidelines = """
+        Common guidelines for all medical team members:
+        - Keep responses focused and concise (2-3 lines maximum).
+        - When your part is complete or another specialist would be more appropriate, use TRANSFER:RUBY on a new line to hand control back to Ruby.
+        - Always consider the member's full journey and long-term health outcomes
+        - Frame advice in context of their personalized health plan and goals
+        """
+        self.system_prompt = f"{elyx_context}\n\n{system_prompt.strip()}\n\n{common_guidelines}"
+        self.name = name
+        self.role = role
+        self.llm = llm
+
     async def respond(self, state: AgentState) -> Dict[str, Any]:
         """Default respond - can be overridden by subclasses"""
         conversation_context = "\n".join([
@@ -60,10 +84,23 @@ class MedicalAgent:
         ])
         messages = [
             SystemMessage(content=self.system_prompt),
-            HumanMessage(content=f"Recent conversation context (last messages):\n{conversation_context}\nPlease respond as {self.name} ({self.role}). Keep it short (2-3 lines). ")
+            HumanMessage(content=f"Recent conversation context (last messages):\n{conversation_context}\nPlease respond as {self.name} ({self.role}). ")
         ]
         response = await self.llm.ainvoke(messages)
-        return {"response": response.content, "agent": self.name.lower()}
+
+        text = response.content
+        resolved = "CONSULTATION_RESOLVED" in text
+        transfer = None
+        for part in text.splitlines():
+            if "TRANSFER:" in part:
+                transfer = "ruby"
+                break
+        
+        # Clean response by removing control tokens
+        lines = [line for line in text.splitlines() if not (("CONTROL:" in line) or ("TRANSFER:" in line) or ("CONSULTATION_RESOLVED" in line))]
+        text = "\n".join(lines).strip()
+
+        return {"response": text, "agent": self.name.lower(), "resolved": resolved, "transfer_to": transfer}
 
 
 # --- Team agents ---
@@ -105,7 +142,7 @@ class PatientAgent(MedicalAgent):
         conversation_context = "".join([f"{msg['sender']}: {msg.get('message','')}" for msg in state["conversation_history"][-6:]])
         messages = [
             SystemMessage(content=self.system_prompt),
-            HumanMessage(content=f"Recent conversation context (last messages): {conversation_context} You are Rohan Patel. Respond briefly (2-3 lines). If scheduling or an urgent escalation is needed, include the token ESCALATE: Sarah Tan on its own line.")
+            HumanMessage(content=f"Recent conversation context (last messages): {conversation_context} You are Rohan Patel. Respond briefly (2-3 lines).")
         ]
         response = await self.llm.ainvoke(messages)
         return {"response": response.content.strip(), "agent": "patient"}
@@ -118,6 +155,7 @@ class ConciergeAgent(MedicalAgent):
         - Always open the team's turn with a short 1-2 line message.
         - Announce which specialist will take the lead next by setting CONTROL:<agent_name> in your message (e.g. CONTROL:dr_warren).
         - Use plain language and confirm actions. Keep it tiny (1-2 lines).
+        - If you think that good enough consulting has been done or if the conversation grew very long then just sum it up for patient and include CONSULTATION_RESOLVED on a new line to mark the end.
         """
         super().__init__(name="Ruby", role="concierge", llm=llm, system_prompt=system_prompt)
 
@@ -145,7 +183,11 @@ class ConciergeAgent(MedicalAgent):
             control = desired
         if not control:
             # default fallback
-            control = "dr_warren"
+            control = "ruby"
+
+        # Remove all of the lines with CONTROL in that
+        lines = [line for line in text.splitlines() if "CONTROL:" not in line]
+        text = "\n".join(lines).strip()
 
         return {"response": text, "agent": "ruby", "transfer_to": control}
 
@@ -154,22 +196,9 @@ class MedicalStrategist(MedicalAgent):
     def __init__(self, llm: BaseChatModel):
         system_prompt = """
         You are Dr. Warren, the Medical Strategist. Authoritative, precise, scientific.
-        - Give a short clinical take (2-3 lines) and if appropriate recommend tests or a diagnosis.
-        - If you believe the case is resolved, include CONSULTATION_RESOLVED on a new line.
-        - Optionally request transfer using TRANSFER:<agent_name> on its own line if you want another specialist to follow up.
+        - Give a short clinical take and if appropriate recommend tests or a diagnosis.
         """
         super().__init__(name="Dr_Warren", role="medical_strategist", llm=llm, system_prompt=system_prompt)
-
-    async def respond(self, state: AgentState) -> Dict[str, Any]:
-        # Use the MedicalAgent.respond but allow capturing transfer/resolve tokens
-        base = await super().respond(state)
-        text = base["response"].strip()
-        resolved = "CONSULTATION_RESOLVED" in text
-        transfer = None
-        for line in text.splitlines():
-            if line.startswith("TRANSFER:"):
-                transfer = line.split("TRANSFER:", 1)[1].strip().lower()
-        return {"response": text.replace("CONSULTATION_RESOLVED", "").strip(), "agent": "dr_warren", "resolved": resolved, "transfer_to": transfer}
 
 
 class PerformanceScientist(MedicalAgent):
@@ -177,7 +206,6 @@ class PerformanceScientist(MedicalAgent):
         system_prompt = """
         You are Advik, the Performance Scientist. Analytical and pattern-oriented.
         - Focus on wearable data, HRV, sleep trends, and experiments.
-        - Keep it short (2-3 lines). If you want to hand off, use TRANSFER:<agent>.
         """
         super().__init__(name="Advik", role="performance_scientist", llm=llm, system_prompt=system_prompt)
 
@@ -186,8 +214,7 @@ class Nutritionist(MedicalAgent):
     def __init__(self, llm: BaseChatModel):
         system_prompt = """
         You are Carla, the Nutritionist. Practical and behavioral.
-        - Give short nutrition guidance and actionable steps (2-3 lines).
-        - Use TRANSFER:<agent> if you'd like PT or Dr. Warren to weigh in.
+        - Give short nutrition guidance and actionable steps.
         """
         super().__init__(name="Carla", role="nutritionist", llm=llm, system_prompt=system_prompt)
 
@@ -196,8 +223,7 @@ class Physiotherapist(MedicalAgent):
     def __init__(self, llm: BaseChatModel):
         system_prompt = """
         You are Rachel, the PT / Physiotherapist. Direct and encouraging.
-        - Provide short mobility/rehab or exercise cues. Keep to 2-3 lines.
-        - Use TRANSFER:<agent> to request another expert.
+        - Provide short mobility/rehab or exercise cues.
         """
         super().__init__(name="Rachel", role="physio", llm=llm, system_prompt=system_prompt)
 
@@ -206,8 +232,7 @@ class ConciergeLead(MedicalAgent):
     def __init__(self, llm: BaseChatModel):
         system_prompt = """
         You are Neel, the Concierge Lead. Strategic and reassuring.
-        - Step in for high-level summaries or to de-escalate. 2-3 lines.
-        - Use TRANSFER:<agent> if necessary.
+        - Step in for high-level summaries or to de-escalate.
         """
         super().__init__(name="Neel", role="concierge_lead", llm=llm, system_prompt=system_prompt)
 
@@ -261,7 +286,7 @@ class OrchestatedAgent:
         workflow.add_node("format_patient", self._format_patient_message)
         workflow.add_node("check_resolution", self._check_resolution_node)
 
-        # Flow: Ruby -> format -> control dispatch -> agent -> format -> patient -> format -> ruby -> ...
+        # Flow: Ruby -> format -> control dispatch -> agent -> format -> patient -> format -> check_resolution
         workflow.set_entry_point("ruby_node")
         workflow.add_edge("ruby_node", "format_ruby")
         workflow.add_edge("format_ruby", "control_dispatch")
@@ -271,17 +296,35 @@ class OrchestatedAgent:
         workflow.add_edge("patient_node", "format_patient")
         workflow.add_edge("format_patient", "check_resolution")
 
-        # From check_resolution decide whether to go back to ruby_node or end
+        # From check_resolution decide whether to go back to ruby_node or to the next agent (via control_dispatch), or end.
         workflow.add_conditional_edges(
             "check_resolution",
             self._should_continue,
             {
-                "continue": "ruby_node",
+                "continue_agent": "control_dispatch",  # -> agent_node next (control_dispatch sets current_agent)
+                "continue_ruby": "ruby_node",
                 "end": END
             }
         )
 
         return workflow.compile()
+
+
+    def _should_continue(self, state: AgentState) -> str:
+        """Decide next step after patient turn:
+           - If resolved or turns >= limit -> end
+           - If control_agent is set and not 'ruby' -> continue_agent (call control_dispatch -> agent_node)
+           - Otherwise -> continue_ruby (Ruby gets the next team turn)
+        """
+        if state.get("resolved"):
+            return "end"
+
+        control = (state.get("control_agent") or "").lower()
+        if control and control != ControlAgent.RUBY.value:
+            # keep the current team agent in control (skip Ruby) — go via control_dispatch so agent_node sees correct current_agent
+            return "continue_agent"
+
+        return "continue_ruby"
 
     # --- Nodes implementations ---
     async def _ruby_node(self, state: AgentState) -> AgentState:
@@ -307,6 +350,9 @@ class OrchestatedAgent:
                 break
         if control:
             state["control_agent"] = control
+        
+        lines = [line for line in response.splitlines() if "CONTROL:" not in line]
+        response = "\n".join(lines).strip()
 
         structured = {"sender": "ruby", "role": "concierge", "message": response}
         print(f"Ruby: {structured['message']}")
@@ -331,7 +377,7 @@ class OrchestatedAgent:
             ControlAgent.CARLA.value: self.carla,
             ControlAgent.RACHEL.value: self.rachel,
             ControlAgent.NEEL.value: self.neel
-        }.get(control, self.dr_warren)
+        }.get(control, self.ruby)
 
         response_data = await agent_obj.respond(state)
         text = response_data.get("response", "")
@@ -401,11 +447,6 @@ class OrchestatedAgent:
         # No-op; resolution handled when agent sets state['resolved']
         return state
 
-    def _should_continue(self, state: AgentState) -> str:
-        if state.get("resolved") or state.get("turn_count", 0) >= 10:
-            return "end"
-        return "continue"
-
     async def start_conversation(self, initial_patient_query: str = None) -> Dict[str, Any]:
         print("🏥 Starting Swarm Medical Consultation")
         print("=" * 50)
@@ -432,7 +473,7 @@ class OrchestatedAgent:
             initial_state["turn_count"] = 1
             
         try:
-            final_state = await self.graph.ainvoke(initial_state)
+            final_state = await self.graph.ainvoke(initial_state, {"recursion_limit": 100})
 
             print("\n" + "=" * 50)
             print("🏥 Swarm Medical Consultation Complete")
@@ -465,15 +506,3 @@ class OrchestatedAgent:
             print(f"\n💾 Error state logged to: {log_file}")
             print(f"Error during conversation: {str(e)}")
             return error_data
-
-
-# Example usage
-async def main():
-    agent = OrchestatedAgent()
-    sample = "I've been having persistent headaches for the past week, especially in the morning. They seem to get worse when I stand up quickly."
-    result = await agent.start_conversation(sample)
-    print(f"\n📊 Final Result: {result}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

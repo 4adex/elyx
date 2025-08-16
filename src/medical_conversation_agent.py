@@ -332,7 +332,7 @@ class MedicalConversationAgent:
         
         try:
             # Run the conversation
-            final_state = await self.graph.ainvoke(initial_state)
+            final_state = await self.graph.ainvoke(initial_state, {"recursion_limit": 100})
             
             print("\n" + "=" * 50)
             print("🏥 Medical Consultation Complete")
