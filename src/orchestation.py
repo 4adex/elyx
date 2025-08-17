@@ -67,12 +67,18 @@ class MedicalAgent:
 
         Here you are dealing with a patient, and this is just a thread of one of queries he asks in 4-5 times a week. So try to resolve it as soon as possible.
         """
-        
         common_guidelines = """
         Common guidelines for all medical team members:
-        - Keep responses focused and concise (2-3 lines maximum).
+        - **VERY IMPORTANT** Keep responses focused and concise (2-3 lines maximum).
         - Frame advice in context of their personalized health plan and goals
         - If you think that the user intent has been decently resolved then just use the CONVERSATION_RESOLVED, in next line to end the conversation.
+        
+        You are consulting with Rohan Patel, a 46-year-old Regional Head of Sales at a FinTech company.
+            He is based in Singapore but travels frequently to the UK, US, South Korea, and Jakarta.
+            Married with two young children; has a supportive wife.
+            He is highly analytical, time-conscious, and health-focused due to family history concerns.
+            Prefers being addressed as Rohan.
+            Keep your explanations clear, concise, and data-driven, while respecting his busy schedule.
         """
 
         worker_guidelines = """
@@ -200,7 +206,6 @@ class PerformanceScientist(MedicalAgent):
         """
         super().__init__(name="Advik", role="performance_scientist", llm=llm, system_prompt=system_prompt)
 
-
 class Nutritionist(MedicalAgent):
     def __init__(self, llm: BaseChatModel):
         system_prompt = """
@@ -209,15 +214,14 @@ class Nutritionist(MedicalAgent):
         """
         super().__init__(name="Carla", role="nutritionist", llm=llm, system_prompt=system_prompt)
 
-
 class Physiotherapist(MedicalAgent):
     def __init__(self, llm: BaseChatModel):
         system_prompt = """
         You are Rachel, the PT / Physiotherapist. Direct and encouraging.
         - Provide short mobility/rehab or exercise cues.
         """
+        
         super().__init__(name="Rachel", role="physio", llm=llm, system_prompt=system_prompt)
-
 
 class ConciergeLead(MedicalAgent):
     def __init__(self, llm: BaseChatModel):
@@ -226,7 +230,6 @@ class ConciergeLead(MedicalAgent):
         - Step in for high-level summaries or to de-escalate.
         """
         super().__init__(name="Neel", role="concierge_lead", llm=llm, system_prompt=system_prompt)
-
 
 # --- Control enum ---
 class ControlAgent(Enum):
@@ -320,7 +323,7 @@ class OrchestatedAgent:
         return workflow.compile()
 
     def _should_continue_to_patient(self, state: AgentState) -> str:
-        MAX_TURNS = 1
+        MAX_TURNS = 4
         if state.get("turn_count", 0) >= MAX_TURNS:
             print(f"[guard] max turns {MAX_TURNS} reached -> ending conversation")
             state["resolved"] = True
@@ -413,6 +416,12 @@ class OrchestatedAgent:
             ControlAgent.RACHEL.value: self.rachel,
             ControlAgent.NEEL.value: self.neel
         }.get(control)
+
+        # Fallback if not valid
+        if not agent_obj:
+            state["status"] = "resolved"
+            state["resolved"] = True
+            return state
 
         response_data = await agent_obj.respond(state)
         text = response_data.get("response", "")
