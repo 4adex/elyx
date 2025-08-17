@@ -13,19 +13,21 @@ Notes:
 - Any agent may mark the consultation resolved by including the token "CONSULTATION_RESOLVED" in their response; the orchestrator strips that and sets resolved.
 """
 
-import asyncio
-from typing import Dict, Any, List, TypedDict, Literal, Optional
+from typing import Dict, Any, List, TypedDict, Literal
 from dataclasses import dataclass
 from enum import Enum
+from dotenv import load_dotenv
+import os
 
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langchain_core.language_models import BaseChatModel
 
 from .conversation_logger import ConversationLogger
 
+load_dotenv()
 
 class ConversationStatus(Enum):
     ONGOING = "ongoing"
@@ -37,7 +39,6 @@ class AgentState(TypedDict):
     current_turn: Literal["patient", "team"]
     conversation_history: List[Dict[str, Any]]
     patient_query: str
-    doctor_diagnosis: str
     status: ConversationStatus
     resolved: bool
     turn_count: int
@@ -70,12 +71,17 @@ class MedicalAgent:
         common_guidelines = """
         Common guidelines for all medical team members:
         - Keep responses focused and concise (2-3 lines maximum).
-        - When your part is complete or you must transfer your control back to main doctor agent ruby, use TRANSFER:RUBY on a new line to hand control back to Ruby.
-        - If you think that conversation has been resolved then 
         - Frame advice in context of their personalized health plan and goals
+        - If you think that the user intent has been decently resolved then just use the CONVERSATION_RESOLVED, in next line to end the conversation.
+        """
+
+        worker_guidelines = """
+        - Your job is to always do your part and transfer control back to ruby as soon as possible, use TRANSFER:RUBY on a new line to hand control back to Ruby.
         """
         if role.lower() == "patient":
             self.system_prompt = system_prompt.strip()
+        elif role.lower() != "concierge":
+            self.system_prompt = f"{elyx_context}\n\n{system_prompt.strip()}\n\n{common_guidelines}\n{worker_guidelines}"
         else:
             self.system_prompt = f"{elyx_context}\n\n{system_prompt.strip()}\n\n{common_guidelines}"
         self.name = name
@@ -93,19 +99,7 @@ class MedicalAgent:
         ]
         response = await self.llm.ainvoke(messages)
 
-        text = response.content
-        resolved = "CONSULTATION_RESOLVED" in text
-        transfer = None
-        for part in text.splitlines():
-            if "TRANSFER:" in part:
-                transfer = "ruby"
-                break
-        
-        # Clean response by removing control tokens
-        lines = [line for line in text.splitlines() if not (("CONTROL:" in line) or ("TRANSFER:" in line) or ("CONSULTATION_RESOLVED" in line))]
-        text = "\n".join(lines).strip()
-
-        return {"response": text, "agent": self.name.lower(), "resolved": resolved, "transfer_to": transfer}
+        return {"response": response, "agent": self.name.lower()}
 
 
 # --- Team agents ---
@@ -159,13 +153,16 @@ class ConciergeAgent(MedicalAgent):
         You are Ruby, the Concierge / Orchestrator. Empathetic, organized, and proactive.
         - Always open the team's turn with a short 1-2 line message.
         - Announce which specialist will take the lead next by setting CONTROL:<agent_name>
-        - END CONVERSATIONS WHEN:
-          1. Medical concern has been addressed
-          2. Clear next steps are established
-          3. Patient has confirmed understanding
-          4. No further value can be added in this session
-        - Use CONSULTATION_RESOLVED token when ending conversations
-        - LIMIT CONVERSATIONS to 6-8 turns maximum
+        - You are currently responding to a small query asked by the user, after immediate query has been answered well, use CONSULTATION_RESOLVED on next line to END conversations.
+
+        You need to choose from the specialist agents which do the following:
+        - **Dr. Warren (Medical Strategist):** Use when the issue involves diagnosis, lab interpretation, or overall medical direction.  
+        - **Advik (Performance Scientist):** Use when the issue involves wearable data, HRV, sleep, recovery, or stress patterns.  
+        - **Carla (Nutritionist):** Use when the issue involves diet, supplements, meal planning, or food tracking.  
+        - **Rachel (Physiotherapist):** Use when the issue involves injuries, exercise form, rehab, mobility, or physical training.  
+        - **Neel (Concierge Lead):** Use when escalation, strategic review, or big-picture alignment with long-term goals is needed.  
+        - Just respond with your message if you think that no specialist is needed. Otherwise pick the best specialist to respond next from: dr_warren, advik, carla, rachel, neel. Output two short lines: your message then on its own line CONTROL:<agent>.
+        - **IMPORTANT** - Only use these specific words to transfer control, CONTROL:dr_warren, CONTROL:advik, CONTROL:carla, CONTROL:rachel, CONTROL:neel
         """
 
         super().__init__(name="Ruby", role="concierge", llm=llm, system_prompt=system_prompt)
@@ -175,7 +172,7 @@ class ConciergeAgent(MedicalAgent):
         # If state already contains a desired control_agent, Ruby should confirm and not override unless she chooses to.
         desired = state.get("control_agent")
         conversation_context = "\n".join([f"{m['sender']}: {m['message']}" for m in state["conversation_history"][-6:]])
-        human_instructions = f"Context:\n{conversation_context}\n\nIf control_agent is set to '{desired}', confirm and repeat CONTROL:{desired}. Otherwise pick the best specialist to respond next from: dr_warren, advik, carla, rachel, neel. Output two short lines: your message then on its own line CONTROL:<agent>"
+        human_instructions = f"Context:\n{conversation_context}"
         messages = [
             SystemMessage(content=self.system_prompt),
             HumanMessage(content=human_instructions)
@@ -183,24 +180,7 @@ class ConciergeAgent(MedicalAgent):
         response = await self.llm.ainvoke(messages)
         text = response.content.strip()
 
-        # Try to parse CONTROL:<agent> from Ruby's message
-        control = None
-        for part in text.splitlines()[1:]:
-            if "CONTROL:" in part:
-                control = part.split("CONTROL:", 1)[1].strip().lower()
-                break
-        # Fallback: if desired set, use it
-        if not control and desired:
-            control = desired
-        if not control:
-            # default fallback
-            control = "ruby"
-
-        # Remove all of the lines with CONTROL in that
-        lines = [line for line in text.splitlines() if "CONTROL:" not in line]
-        text = "\n".join(lines).strip()
-
-        return {"response": text, "agent": "ruby", "transfer_to": control}
+        return {"response": text, "agent": "ruby"}
 
 
 class MedicalStrategist(MedicalAgent):
@@ -303,17 +283,27 @@ class OrchestatedAgent:
         workflow.add_edge("format_ruby", "control_dispatch")
         
         # Add conditional edges from control_dispatch
+        # TODO: Here is control dispatch only we will check for the resolution in the ruby's message if it exists
         workflow.add_conditional_edges(
             "control_dispatch",
-            lambda x: "ruby_flow" if x["control_agent"] == "ruby" else "agent_flow",
+            self._control_dispatch,
             {
                 "ruby_flow": "patient_node",  # If control is ruby, skip agent node and go directly to patient
-                "agent_flow": "agent_node"    # Otherwise continue through agent node
+                "agent_flow": "agent_node" ,   # Otherwise continue through agent node
+                "end": END
+            }
+        )
+
+        workflow.add_conditional_edges(
+            "format_agent",
+            self._should_continue_to_patient,
+            {
+                "end" : END,
+                "continue": "patient_node"
             }
         )
         
         workflow.add_edge("agent_node", "format_agent")
-        workflow.add_edge("format_agent", "patient_node")
         workflow.add_edge("patient_node", "format_patient")
         workflow.add_edge("format_patient", "check_resolution")
 
@@ -329,14 +319,20 @@ class OrchestatedAgent:
 
         return workflow.compile()
 
-
-    def _should_continue(self, state: AgentState) -> str:
-        # Add turn limit check
-        if state.get("turn_count", 0) >= 15:  # Reasonable conversation limit
-            print("\n=== Turn limit reached, forcing resolution ===")
+    def _should_continue_to_patient(self, state: AgentState) -> str:
+        MAX_TURNS = 1
+        if state.get("turn_count", 0) >= MAX_TURNS:
+            print(f"[guard] max turns {MAX_TURNS} reached -> ending conversation")
             state["resolved"] = True
             state["status"] = ConversationStatus.RESOLVED
             return "end"
+        
+        if state["resolved"]:
+            return "end"
+        
+        return "continue"
+
+    def _should_continue(self, state: AgentState) -> str:
 
         # Existing resolution check
         if state.get("status") == ConversationStatus.RESOLVED or state.get("resolved"):
@@ -348,6 +344,15 @@ class OrchestatedAgent:
             return "continue_agent"
 
         return "continue_ruby"
+    
+    def _control_dispatch(self, state: AgentState) -> str:
+        if state.get("status") == ConversationStatus.RESOLVED or state.get("resolved"):
+            return "end"
+        elif state.get("control_agent") == ControlAgent.RUBY.value:
+            return "ruby_flow"
+        else:
+            return "agent_flow"
+
 
     # --- Nodes implementations ---
     async def _ruby_node(self, state: AgentState) -> AgentState:
@@ -355,21 +360,26 @@ class OrchestatedAgent:
         # Always have Ruby respond first in the team turn
         response_data = await self.ruby.respond(state)
         text = response_data["response"]
-        transfer_to = response_data.get("transfer_to")
 
         state["current_response"] = text
         state["current_agent"] = "ruby"
-        if transfer_to:
-            state["control_agent"] = transfer_to
         return state
 
     async def _format_ruby_message(self, state: AgentState) -> AgentState:
         response = state["current_response"]
+        
+        resolved = any("CONSULTATION_RESOLVED" in line for line in response.splitlines())
+        if resolved:
+            state["resolved"] = True
+            state["status"] = ConversationStatus.RESOLVED
+
         # Try to parse CONTROL:<agent> from ruby message; if present, keep it
         control = None
         for line in response.splitlines():
             if "CONTROL:" in line:
                 control = line.split("CONTROL:", 1)[1].strip().lower()
+                # Remove dots, commas from the control text
+                control = control.replace(".", "").replace(",", "")
                 break
         if control:
             state["control_agent"] = control
@@ -395,6 +405,7 @@ class OrchestatedAgent:
     async def _agent_node(self, state: AgentState) -> AgentState:
         control = state.get("current_agent")
         print(f"\n--- Team Agent Turn: {control} (Turn {state['turn_count']}) ---")
+        #TODO: It should not be possible that agent is something else, add a fallback here
         agent_obj = {
             ControlAgent.DR_WARREN.value: self.dr_warren,
             ControlAgent.ADVIK.value: self.advik,
@@ -405,41 +416,32 @@ class OrchestatedAgent:
 
         response_data = await agent_obj.respond(state)
         text = response_data.get("response", "")
-        resolved = response_data.get("resolved", False)  # Only use the flag since text is already cleaned
-        transfer = response_data.get("transfer_to")
-
-        # If agent asked to transfer control, record it so Ruby can confirm next loop.
-        if transfer:
-            # canonicalize common names
-            state["control_agent"] = transfer
             
         state["current_response"] = text
-        # Ensure resolved state is properly updated
-        if resolved:
-            state["resolved"] = True
-            state["status"] = ConversationStatus.RESOLVED
         return state
 
     async def _format_agent_message(self, state: AgentState) -> AgentState:
         response = state["current_response"]
         agent = state.get("current_agent")
+        text = response.content.strip()
 
-        # Extract REASONING: block if present and keep it in structured data
-        reasoning = None
-        if "REASONING:" in response:
-            parts = response.split("REASONING:", 1)
-            main = parts[0].strip()
-            reasoning = parts[1].strip()
-        else:
-            main = response.strip()
+        for part in text.splitlines():
+            if "TRANSFER:" in part:
+                state["control_agent"] = "ruby"
 
-        structured = {"sender": agent, "role": agent, "message": main}
-        if reasoning:
-            structured["reasoning"] = reasoning
+        resolved = any("CONSULTATION_RESOLVED" in line for line in text.splitlines())
+        if resolved:
+            state["resolved"] = True
+            state["status"] = ConversationStatus.RESOLVED
+
+        lines = [line for line in text.splitlines() if not (("CONTROL:" in line) or ("TRANSFER:" in line) or ("CONSULTATION_RESOLVED" in line))]
+        text = "\n".join(lines).strip()
+
+        #TODO: Manage reasoning for agents
+
+        structured = {"sender": agent, "role": agent, "message": text}
 
         print(f"{agent.capitalize()}: {structured['message']}")
-        if reasoning:
-            print(f"Reasoning: {structured['reasoning']}")
 
         state["conversation_history"].append(structured)
         state["current_turn"] = "patient"
@@ -467,6 +469,8 @@ class OrchestatedAgent:
         print(f"Patient: {structured['message']}")
         state["conversation_history"].append(structured)
         # increment turn count each full cycle (team+patient)
+
+        #TODO: Patient should also be able to end the conversation
         state["turn_count"] += 1
         state["current_turn"] = "team"
         return state
@@ -484,7 +488,6 @@ class OrchestatedAgent:
             current_turn="team",
             conversation_history=[],
             patient_query="",
-            doctor_diagnosis="",
             status=ConversationStatus.ONGOING,
             resolved=False,
             turn_count=0,
@@ -510,13 +513,8 @@ class OrchestatedAgent:
                 "status": "completed",
                 "conversation_history": final_state["conversation_history"],
                 "patient_query": final_state["patient_query"],
-                "doctor_diagnosis": final_state.get("doctor_diagnosis", ""),
                 "resolved": final_state["resolved"],
-                "total_turns": final_state["turn_count"],
-                "metadata": {
-                    "model": getattr(self.llm, "model", None),
-                    "temperature": getattr(self.llm, "temperature", None)
-                }
+                "total_turns": final_state["turn_count"]
             }
 
             log_file = self.logger.log_conversation(conversation_data)
